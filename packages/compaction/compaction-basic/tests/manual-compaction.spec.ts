@@ -20,16 +20,18 @@ import type {
   StreamChunk,
   TokenUsage,
 } from '@deepseek-ai/dsh-llm'
+import { ReasoningEffortId } from '@deepseek-ai/dsh-llm/brand'
 import SessionStore, { buildForkSeed, Session, SessionId, type SessionEvent } from '@deepseek-ai/dsh-session'
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import LlmRuntime from '@deepseek-ai/dsh-llm'
 import type { ContextFormed } from '@deepseek-ai/dsh-llm'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
-import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Agent, ModelSelection } from '@deepseek-ai/dsh-agent'
 import type {
   SummarizationInput,
   SummaryResult,
 } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
+import { summarizeWithLlm } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -40,6 +42,7 @@ declare module '@deepseek-ai/dsh-llm' {
 }
 
 const MODEL = 'mock'
+const MODEL_B = 'mock-b'
 const SIGNAL = new AbortController().signal
 const PROMPT = 'older conversation history '.repeat(60)
 
@@ -72,9 +75,22 @@ class GatedCompactionEngine extends BasicCompactionEngine {
   }
 }
 
+/** A gated engine whose summarize runs the real LLM path so route resolution is observable. */
+class RealSummaryEngine extends GatedCompactionEngine {
+  override async summarize(
+    input: SummarizationInput,
+    agent: Agent,
+    signal?: AbortSignal,
+  ): Promise<SummaryResult> {
+    this.calls.push(input)
+    return summarizeWithLlm(this.ctx, this.config, input, agent, signal)
+  }
+}
+
 /** One text answer per request, with a context window large enough to avoid pressure. */
 class TextAdapter extends LlmAdapter {
   readonly requests: RequestMessage[][] = []
+  readonly routes: string[] = []
 
   override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
     return Promise.resolve({
@@ -85,8 +101,13 @@ class TextAdapter extends LlmAdapter {
     })
   }
 
-  override async * stream(options: { messages: readonly RequestMessage[] }): AsyncIterable<StreamChunk> {
+  override async * stream(options: {
+    messages: readonly RequestMessage[]
+    provider?: string
+    model?: string
+  }): AsyncIterable<StreamChunk> {
     this.requests.push([...options.messages])
+    this.routes.push(`${options.provider ?? ''}/${options.model ?? ''}`)
     yield { type: 'block-start', index: 0, blockType: 'text' }
     yield { type: 'block-end', index: 0, block: { type: 'text', text: 'answer' } }
     yield { type: 'finish', reason: { kind: 'stop' } }
@@ -102,15 +123,17 @@ interface LoopHarness {
 }
 
 /** Real loop and session store around manual compaction. */
-async function loopHarness(): Promise<LoopHarness> {
+async function loopHarness(
+  engine: new (ctx: Context, config?: { auto?: boolean }) => GatedCompactionEngine = GatedCompactionEngine,
+): Promise<LoopHarness> {
   const ctx = new Context()
   await mountAgentLoopTestDependencies(ctx)
   ctx.sessions.registerMessageProjection(imageOffloadProjection)
   await ctx.plugin(AgentLoop, { agents: [] })
   await ctx.plugin(TokenMeter)
   const adapter = new TextAdapter()
-  ctx.llm.registerAdapter([MODEL], adapter)
-  const compact = new GatedCompactionEngine(ctx, { auto: false })
+  ctx.llm.registerAdapter([MODEL, MODEL_B], adapter)
+  const compact = new engine(ctx, { auto: false })
   const agent = await ctx.agentLoop.create(SessionId('manual-compact'), { provider: MODEL, model: MODEL })
   const log: string[] = []
   ctx.on('session/event', (_session, event) => {
@@ -170,7 +193,7 @@ function deferred(): { promise: Promise<undefined>; resolve: () => void } {
 }
 
 /** A closed-tail session with compactable exchanges and no live agent. */
-function closedConversation(turns = 2, lastTurnNumber = turns): Session {
+function closedConversation(turns = 2, lastTurnNumber = turns, withHeader = true): Session {
   const session = Session.create(SessionId(`closed-${turns}-${lastTurnNumber}`))
   for (let index = 1; index <= turns; index += 1) {
     const turn = index === turns ? lastTurnNumber : index
@@ -180,7 +203,7 @@ function closedConversation(turns = 2, lastTurnNumber = turns): Session {
       source: { kind: 'user' },
     }), { surfaceOp: 'append' })
     session.append('step/start', { turn, step: 1 })
-    if (index === 1) {
+    if (index === 1 && withHeader) {
       session.append('request/header', {
         header: { config: { provider: MODEL, model: MODEL } },
         reason: 'initial',
@@ -206,10 +229,12 @@ function fakeAgent(
   session: Session,
   reserve: () => (() => void) | undefined,
   maintenanceSignal = new AbortController().signal,
+  selection: ModelSelection | undefined = undefined,
 ): Agent {
   return {
     session,
     options: { provider: MODEL, model: MODEL },
+    model: { current: () => selection },
     runMaintenance<T>(task: (signal: AbortSignal) => Promise<T>): Promise<T> {
       const release = reserve()
       if (release === undefined) throw new Error('agent already has active work')
@@ -937,5 +962,92 @@ describe('compactNow transaction and failure classification', () => {
     gate.resolve()
     compact.gate = undefined
     await expect(region).resolves.toMatchObject({ shadowedSeqs: nodes.slice(0, 2) })
+  })
+})
+
+describe('compactNow model selection route', () => {
+  it('summarizes under a pending selection and records it as the request header', async () => {
+    const harness = await loopHarness(RealSummaryEngine)
+    const { ctx, agent, compact, adapter } = harness
+    try {
+      await seedHistory(harness)
+      agent.model.select({ provider: MODEL, model: MODEL_B, reasoningEffort: ReasoningEffortId('high') })
+      const routed = agent.session.snapshotEvents().filter(event => event.type === 'request/header').at(-1)
+      expect(routed?.type === 'request/header' && routed.data.header.config)
+        .toMatchObject({ provider: MODEL, model: MODEL })
+      const before = agent.session.snapshotEvents().filter(event => event.type === 'request/header').length
+
+      expect(await compact.compactNow(agent, SIGNAL)).not.toBeNull()
+
+      const headers = agent.session.snapshotEvents().filter(event => event.type === 'request/header')
+      expect(headers).toHaveLength(before + 1)
+      const appended = headers.at(-1)
+      expect(appended?.type === 'request/header' && appended.data.reason).toBe('change')
+      expect(appended?.type === 'request/header' && appended.data.header.config).toEqual({
+        provider: MODEL,
+        model: MODEL_B,
+        reasoningEffort: 'high',
+      })
+      expect(adapter.routes.at(-1)).toBe(`${MODEL}/${MODEL_B}`)
+      const summary = agent.session.snapshotEvents().findLast(event => event.type === 'compaction/summary')
+      expect(summary?.type === 'compaction/summary' && summary.data.provider).toBe(MODEL)
+      expect(summary?.type === 'compaction/summary' && summary.data.model).toBe(MODEL_B)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('appends no header when the routed route already matches the selection', async () => {
+    const harness = await loopHarness()
+    const { ctx, agent, compact } = harness
+    try {
+      await seedHistory(harness)
+      const before = agent.session.snapshotEvents().filter(event => event.type === 'request/header').length
+
+      expect(await compact.compactNow(agent, SIGNAL)).not.toBeNull()
+
+      expect(agent.session.snapshotEvents().filter(event => event.type === 'request/header'))
+        .toHaveLength(before)
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('copies the routed header tools onto the selection header', async () => {
+    const { compact } = detachedService()
+    const session = closedConversation(2)
+    const routedTools = [{ name: 'probe', description: 'probe tool', parameters: { type: 'object', properties: {} } }]
+    session.append('request/header', {
+      header: { config: { provider: MODEL, model: MODEL }, tools: routedTools },
+      reason: 'change',
+    })
+    const agent = fakeAgent(
+      session,
+      () => () => undefined,
+      new AbortController().signal,
+      { provider: MODEL, model: MODEL_B },
+    )
+
+    expect(await compact.compactNow(agent, SIGNAL)).not.toBeNull()
+
+    const appended = session.snapshotEvents().filter(event => event.type === 'request/header').at(-1)
+    expect(appended?.type === 'request/header' && appended.data.reason).toBe('change')
+    expect(appended?.type === 'request/header' && appended.data.header.config).toMatchObject({ model: MODEL_B })
+    expect(appended?.type === 'request/header' && appended.data.header.tools).toEqual(routedTools)
+  })
+
+  it('appends no header for a pending selection when no request was routed yet', async () => {
+    const { compact } = detachedService()
+    const session = closedConversation(2, 2, false)
+    const agent = fakeAgent(
+      session,
+      () => () => undefined,
+      new AbortController().signal,
+      { provider: MODEL, model: MODEL_B },
+    )
+
+    expect(await compact.compactNow(agent, SIGNAL)).not.toBeNull()
+
+    expect(session.snapshotEvents().some(event => event.type === 'request/header')).toBe(false)
   })
 })

@@ -91,7 +91,7 @@ The destination must have a registered adapter, declared context capacity, and a
 
 ### On-demand condensation with /compact
 
-With `dsh-command-compact` mounted, type `/compact` in a chat UI to condense immediately, even below the pressure threshold. The command reports how many history items were condensed and the estimated tokens saved. While the agent is mid-turn or condensation is already running, `/compact` reports that condensation is unavailable; prompts you send while it runs are accepted and start after it finishes.
+With `dsh-command-compact` mounted, type `/compact` in a chat UI to condense immediately, even below the pressure threshold. The command reports how many history items were condensed and the estimated tokens saved. While the agent is mid-turn or condensation is already running, `/compact` reports that condensation is unavailable; prompts you send while it runs are accepted and start after it finishes. The summary targets the model of the latest routed request; a model selected after that request is logged as the summarization request's header first, so `/compact` follows the selection without waiting for the next turn.
 
 ### Trimming oversized tool outputs
 

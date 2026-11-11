@@ -8,6 +8,7 @@ import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { CompactionEngine, ManualCompactionError } from '@deepseek-ai/dsh-compaction'
 import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compaction'
+import { canonicalHeader } from '@deepseek-ai/dsh-session'
 import type { EpochHeader, Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError } from '@deepseek-ai/dsh-llm'
 import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
@@ -75,6 +76,36 @@ function conversationTarget(
   if (agent.options.provider === undefined || agent.options.provider.length === 0
     || agent.options.model === undefined || agent.options.model.length === 0) return undefined
   return { provider: agent.options.provider, model: agent.options.model }
+}
+
+/**
+ * Record the agent's current model selection as the header of a manual
+ * compaction's summarization request. Manual compaction runs while the agent
+ * is idle, so a selection recorded after the last routed request is still
+ * pending and the summarizer would otherwise target that request's route. The
+ * append mirrors the loop's own route-change header: it names the selection
+ * and copies the previous header's tools so the replayed summarization prefix
+ * stays aligned. A matching route, effort-only difference, missing routed
+ * header, or no recorded selection appends nothing.
+ * @param agent - idle agent whose current selection is compared with the routed header.
+ */
+function recordSelectionRouteHeader(agent: Agent): void {
+  const header = agent.session.requestHeader()
+  if (header === undefined) return
+  const selection = agent.model.current()
+  if (selection === undefined
+    || (header.config.provider === selection.provider && header.config.model === selection.model)) return
+  agent.session.append('request/header', {
+    header: canonicalHeader({
+      config: {
+        provider: selection.provider,
+        model: selection.model,
+        ...selection.reasoningEffort === undefined ? {} : { reasoningEffort: selection.reasoningEffort },
+      },
+      ...header.tools === undefined ? {} : { tools: header.tools },
+    }),
+    reason: 'change',
+  })
 }
 
 const thresholdRatioSchema = z.number()
@@ -399,6 +430,9 @@ export class BasicCompactionEngine extends CompactionEngine {
   /**
    * Force one useful idle-session compaction below the pressure threshold, and
    * resolve only after its standalone marker pair is durably checkpointed.
+   * Before summarizing, a selection recorded since the last routed request is
+   * logged as the summarization request's header, so the summary targets the
+   * selected route instead of that request's.
    * @param agent - idle agent whose next-turn admission this call reserves.
    * @param signal - cancellation scoped to this compaction request.
    * @param sourceCommandId - initiating command identity for presentation correlation.
@@ -421,6 +455,7 @@ export class BasicCompactionEngine extends CompactionEngine {
             0,
           )
           if (range === null) return null
+          recordSelectionRouteHeader(agent)
           return await compactSurfaceRegion(
             this.regionDependencies(),
             agent.session,
